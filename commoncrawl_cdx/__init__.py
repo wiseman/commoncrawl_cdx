@@ -3,6 +3,7 @@
 import json
 import logging
 import multiprocessing.dummy as mp
+import urlparse
 import zlib
 
 import boto3
@@ -12,36 +13,44 @@ import requests
 logger = logging.getLogger(__name__)
 FLAGS = gflags.FLAGS
 
+# The base Common Crawl CDX URL to use.
+DEFAULT_CDX_SERVER_URL = 'http://index.commoncrawl.org/'
+
 gflags.DEFINE_integer(
     'num_threads',
     mp.cpu_count(),
     'The number of worker threads to use.')
-
-
-# The defaultCommon Crawl CDX index server to use.
-DEFAULT_CDX_SERVER = 'http://index.commoncrawl.org/'
-
-# The default index collection.
-DEFAULT_COLL = 'CC-MAIN-2015-06'
+gflags.DEFINE_string(
+    'cdx_server_url',
+    'http://index.commoncrawl.org/',
+    'The Common Crawl CDX server to use.')
+gflags.DEFINE_string(
+    'warc_s3_bucket',
+    'aws-publicdatasets',
+    'The S3 bucket from which WARC files are retrieved.')
 
 
 class Error(Exception):
     pass
 
 
-def get_default_cdx_server_url():
-    return cdx_server_url(DEFAULT_COLL)
+def index_api_url(collection, base_url=None):
+    """Constructs the API endipoint URL for an index.
 
+    Each index collection has its own API endpoint. E.g. the
+    collection named CC-MAIN-2015 has an API endpoint at
+    http://index.commoncrawl.org/CC-MAIN-2015-14-index.
 
-def cdx_server_url(collection, server=None):
-    server = server or DEFAULT_CDX_SERVER
-    return server + collection + '-index'
+    """
+    base_url = base_url or FLAGS.cdx_server_url
+    return urlparse.urljoin(base_url, collection + '-index')
 
 
 class MultiIndexReader(object):
-    def __init__(self, url, cdx_server_urls):
-        print cdx_server_urls
-        self.readers = [IndexReader(url, s) for s in cdx_server_urls]
+    """Returns results from multiple indices for a given URL."""
+    def __init__(self, url, index_api_urls):
+        self.index_urls = index_api_urls
+        self.readers = [IndexReader(url, s) for s in index_api_urls]
 
     def _get_reader_page(self, reader_page):
         reader, page = reader_page
@@ -52,7 +61,9 @@ class MultiIndexReader(object):
         for reader in self.readers:
             reader_pages += [(reader, p) for p in range(reader._num_pages())]
         if not reader_pages:
-            logger.info('No index pages found')
+            logger.info(
+                'No index pages found for %r in %r',
+                self.url, self.index_api_urls)
         pool = mp.Pool(FLAGS.num_threads)
         try:
             for page_results in pool.imap_unordered(
@@ -64,41 +75,48 @@ class MultiIndexReader(object):
 
 
 class IndexReader(object):
-    def __init__(self, url, cdx_server_url=None):
+    "Returns result from an index for a given URL."
+    def __init__(self, url, index_api_url):
         self.url = url
-        self.cdx_server_url = cdx_server_url or get_default_cdx_server_url()
-        logger.info('Opening index reader for url %r at server %r',
-                    self.url, self.cdx_server_url)
+        self.index_api_url = index_api_url
+        logger.info('Opening index reader for url %r at index %r',
+                    self.url, self.index_api_url)
 
     def _num_pages(self):
         session = requests.Session()
         r = session.get(
-            self.cdx_server_url,
+            self.index_api_url,
             params={'url': self.url, 'showNumPages': True})
+        r.raise_for_status()
         result = r.json()
         if isinstance(result, dict):
             return result['pages']
         elif isinstance(result, int):
             return result
         else:
-            msg = 'Num pages query returned invalid data: %r' % (r.text,)
+            msg = ('Num-pages query for %r at %r returned invalid data: %r' % (
+                self.url, self.index_api_url, r.text))
             raise Error(msg)
 
     def _get_index_page(self, page_num):
-        url = self.cdx_server_url
+        url = self.index_api_url
         session = requests.Session()
         r = session.get(
             url,
             params={'url': self.url,
                     'output': 'json',
                     'page': page_num})
+        r.raise_for_status()
         lines = r.content.split('\n')
         return [json.loads(l) for l in lines if l]
 
     def itemsiter(self):
         num_pages = self._num_pages()
         if num_pages == 0:
-            logger.info('No index pages found')
+            logger.info(
+                'No index pages found for %r in %r',
+                self.url,
+                self.index_api_url)
         else:
             pool = mp.Pool(FLAGS.num_threads)
             try:
@@ -111,25 +129,25 @@ class IndexReader(object):
                 pool.close()
 
 
-DEFAULT_S3_BUCKET = 'aws-publicdatasets'
+def get_warc_record(filename, range, bucket=None, keep_compressed=False):
+    """Fetches a WARC record from S3.
 
-
-def get_warc_member(filename, bucket=None, range=None):
-    bucket = bucket or DEFAULT_S3_BUCKET
+    range should be a pair with the desired record's [offset, length].
+    """
+    bucket = bucket or FLAGS.warc_s3_bucket
     s3 = boto3.client('s3')
     args = {'Bucket': bucket,
             'Key': filename}
-    if range:
-        range_start = int(range[0])
-        range_end = range_start + int(range[1])
-        args['Range'] = 'bytes=%s-%s' % (range_start, range_end)
+    range_start = int(range[0])
+    range_end = range_start + int(range[1])
+    args['Range'] = 'bytes=%s-%s' % (range_start, range_end)
     logger.info('Fetching %s', args)
     response = s3.get_object(**args)
     streaming_body = response['Body']
     compressed_body = streaming_body.read()
-    # See http://stackoverflow.com/questions/2695152/in-python-how-do-i-decode-gzip-encoding/2695575
-    return zlib.decompress(compressed_body, 16 + zlib.MAX_WBITS)
-
-
-def open_index_reader(url, cdx_server_url=None):
-    return IndexReader(url, cdx_server_url=cdx_server_url)
+    if keep_compressed:
+        return compressed_body
+    else:
+        # See
+        # http://stackoverflow.com/questions/2695152/in-python-how-do-i-decode-gzip-encoding/2695575
+        return zlib.decompress(compressed_body, 16 + zlib.MAX_WBITS)

@@ -40,7 +40,7 @@ def get_multi_index_reader(url, indices=None):
     indices = indices or FLAGS.indices
     return cdx.MultiIndexReader(
         url,
-        [cdx.cdx_server_url(c) for c in FLAGS.indices])
+        [cdx.index_api_url(c) for c in FLAGS.indices])
 
 
 def main(argv):
