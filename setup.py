@@ -27,9 +27,9 @@ settings = dict(
     packages=['commoncrawl_cdx', 'commoncrawl_cdx.cli'],
     test_suite='nose.collector',
     install_requires=[
-        'boto==2.28.0',
+        'boto3',
         'python-gflags',
-        'requests==2.6.2'
+        'requests'
     ],
     tests_require=[
         'nose'
